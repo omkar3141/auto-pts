@@ -41,6 +41,7 @@ class BAP:
             defs.BTP_BAP_EV_SCAN_DELEGATOR_FOUND: [],
             defs.BTP_BAP_EV_BROADCAST_RECEIVE_STATE: [],
             defs.BTP_BAP_EV_PA_SYNC_REQ: [],
+            defs.BTP_BAP_EV_CIS_ESTABLISHED: [],
         }
         self.event_handlers = {
             defs.BTP_BAP_EV_DISCOVERY_COMPLETED: self._ev_discovery_completed,
@@ -144,6 +145,13 @@ class BAP:
         return wait_event_with_condition(
             self.event_queues[defs.BTP_BAP_EV_PA_SYNC_REQ],
             lambda ev: (addr_type, addr) == (ev["addr_type"], ev["addr"]),
+            timeout, remove)
+
+    def wait_cis_established_ev(self, addr_type, addr, cis_id, timeout, remove=False):
+        return wait_event_with_condition(
+            self.event_queues[defs.BTP_BAP_EV_CIS_ESTABLISHED],
+            lambda _addr_type, _addr, _cis_id, *_:
+                (addr_type, addr, cis_id) == (_addr_type, _addr, _cis_id),
             timeout, remove)
 
     def _ev_discovery_completed(self, addr_type, addr, status):

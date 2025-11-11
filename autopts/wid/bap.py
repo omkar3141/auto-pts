@@ -64,7 +64,19 @@ def hdl_wid_20100(params: WIDParams):
     stack.gap.wait_for_connection(timeout=10, addr=addr)
     stack.gap.gap_wait_for_sec_lvl_change(level=2, timeout=30, addr=addr)
 
-    btp.bap_discover(addr_type, addr)
+    try:
+        btp.bap_discover(addr_type, addr)
+    except BTPError:
+        log('bap_discover failed; attempting disconnect and reconnect before retry')
+        try:
+            btp.gap_disconn(addr, addr_type)
+        except Exception as e:
+            log(f'gap_disconn best-effort failed or timed out: {e}')
+        sleep(0.5)
+        btp.gap_conn(addr, addr_type)
+        stack.gap.wait_for_connection(timeout=10, addr=addr)
+        stack.gap.gap_wait_for_sec_lvl_change(level=2, timeout=30, addr=addr)
+        btp.bap_discover(addr_type, addr)
     stack.bap.wait_discovery_completed_ev(addr_type, addr, 30)
 
     if params.test_case_name.startswith('BAP/BA/BASS'):
@@ -1292,7 +1304,36 @@ ac_configs = {
     'BAP/UCL/STR/BV-549-C':     ([(1, 1)], 1),          # AC 3
     'BAP/UCL/STR/BV-550-C':     ([(1, 1)], 1),          # AC 5
     'BAP/UCL/STR/BV-551-C':     ([(1, 0), (0, 1)], 1),  # AC 7(i)
+}
 
+# Define which ASEs should be enabled at which stage for each test case
+# Format: 'test_case': {'sink': 'enable'|'qos', 'source': 'enable'|'qos'}
+# 'enable' = Enable before CIS establishment
+# 'qos' = Keep in QoS Configured state (enable after CIS establishment)
+ase_enable_timing = {
+    # Both Sink and Source in Enable state before CIS
+    'BAP/UCL/STR/BV-523-C': {'sink': 'enable', 'source': 'enable'},
+    'BAP/UCL/STR/BV-524-C': {'sink': 'enable', 'source': 'enable'},
+    'BAP/UCL/STR/BV-525-C': {'sink': 'enable', 'source': 'enable'},
+
+    # Sink Enable, Source QoS Config
+    'BAP/UCL/STR/BV-543-C': {'sink': 'enable', 'source': 'qos'},
+    'BAP/UCL/STR/BV-544-C': {'sink': 'enable', 'source': 'qos'},
+    'BAP/UCL/STR/BV-545-C': {'sink': 'enable', 'source': 'qos'},
+
+    # Sink QoS Config, Source Enable
+    'BAP/UCL/STR/BV-546-C': {'sink': 'qos', 'source': 'enable'},
+    'BAP/UCL/STR/BV-547-C': {'sink': 'qos', 'source': 'enable'},
+    'BAP/UCL/STR/BV-548-C': {'sink': 'qos', 'source': 'enable'},
+
+    # Both Sink and Source in QoS Config state
+    'BAP/UCL/STR/BV-549-C': {'sink': 'qos', 'source': 'qos'},
+    'BAP/UCL/STR/BV-550-C': {'sink': 'qos', 'source': 'qos'},
+    'BAP/UCL/STR/BV-551-C': {'sink': 'qos', 'source': 'qos'},
+}
+
+# Continue ac_configs dictionary
+ac_configs.update({
     # Mono
     # test_case_name: ([CIS_1, CIS_2, ...], num_of_servers, if_mono)
     'BAP/UCL/STR/BV-552-C':     ([(0, 1)], 1, True),    # AC 2, Mono
@@ -1340,7 +1381,7 @@ ac_configs = {
     'BAP/UCL/STR/BV-589-C': ([(0, 1)], 1),              # AC 4, Generic, QoS, Multi Channels
     'BAP/UCL/STR/BV-590-C': ([(0, 1)], 1),              # AC 4, Generic, QoS, Multi Location
     'BAP/UCL/STR/BV-591-C': ([(0, 1)], 1),              # AC 4, Generic, QoS, Multi Channels and Location
-}
+})
 
 
 def hdl_wid_311(params: WIDParams):
@@ -1440,12 +1481,78 @@ def hdl_wid_311(params: WIDParams):
         data = [j for j in range(0, config.octets_per_frame)]
         stream_data[config.ase_id] = bytearray(data)
 
-    for config in stack.bap.ase_configs:
-        enable(config)
+    # Get enable timing configuration for this test case
+    enable_timing = ase_enable_timing.get(params.test_case_name, None)
 
+    # Enable ASEs based on test case requirements
+    # For tests with specific timing requirements, only enable ASEs that should be in Enable state before CIS
+    ases_to_enable_after_cis = []
+    sources_enabled_now = []
     for config in stack.bap.ase_configs:
-        # Start streaming
-        btp.ascs_receiver_start_ready(config.ase_id, config.addr_type, config.addr)
+        should_enable_now = True
+
+        if enable_timing:
+            # Check if this ASE should be enabled now or kept in QoS Config state
+            if config.audio_dir == AudioDir.SINK:
+                should_enable_now = (enable_timing['sink'] == 'enable')
+            elif config.audio_dir == AudioDir.SOURCE:
+                should_enable_now = (enable_timing['source'] == 'enable')
+
+        if should_enable_now:
+            enable(config)
+            if config.audio_dir == AudioDir.SOURCE:
+                sources_enabled_now.append(config)
+        else:
+            # Mark this ASE to be enabled after CIS establishment
+            ases_to_enable_after_cis.append(config)
+
+    # For sources enabled now: wait ENABLING -> send RSR -> wait CIS Established (ensures CIS established)
+    for config in sources_enabled_now:
+        ev = stack.ascs.wait_ascs_ase_state_changed_ev(config.addr_type,
+                                                       config.addr,
+                                                       config.ase_id,
+                                                       ASCSState.ENABLING,
+                                                       10)
+        if ev is not None:
+            # Extra diagnostics before initiating RSR
+            log(f'ASE {config.ase_id} (dir={config.audio_dir}) in ENABLING; sending RSR, then waiting for CIS established: cis_id={config.cis_id}, addr={config.addr}')
+            if config.cis_id is None:
+                log(f'Missing cis_id for ASE {config.ase_id}, cannot wait for CIS established')
+                return False
+            btp.ascs_receiver_start_ready(config.ase_id, config.addr_type, config.addr)
+            stack.bap.wait_cis_established_ev(config.addr_type, config.addr, config.cis_id, 20)
+
+    # Enable ASEs that should be enabled after CIS establishment (e.g., Sink for BV-546/547/548)
+    sources_enabled_after = []
+    for config in ases_to_enable_after_cis:
+        enable(config)
+        if config.audio_dir == AudioDir.SOURCE:
+            sources_enabled_after.append(config)
+
+    # For sources enabled after: wait ENABLING -> send RSR -> wait CIS Established
+    for config in sources_enabled_after:
+        ev = stack.ascs.wait_ascs_ase_state_changed_ev(config.addr_type,
+                                                       config.addr,
+                                                       config.ase_id,
+                                                       ASCSState.ENABLING,
+                                                       10)
+        if ev is not None:
+            # Extra diagnostics before initiating RSR
+            log(f'ASE {config.ase_id} (dir={config.audio_dir}) in ENABLING after CIS; sending RSR, then waiting for CIS established: cis_id={config.cis_id}, addr={config.addr}')
+            if config.cis_id is None:
+                log(f'Missing cis_id for ASE {config.ase_id}, cannot wait for CIS established')
+                return False
+            btp.ascs_receiver_start_ready(config.ase_id, config.addr_type, config.addr)
+            stack.bap.wait_cis_established_ev(config.addr_type, config.addr, config.cis_id, 20)
+
+    # For sinks enabled after: wait CIS Established
+    sinks_enabled_after = [config for config in ases_to_enable_after_cis if config.audio_dir == AudioDir.SINK]
+    for config in sinks_enabled_after:
+        log(f'Waiting for CIS established for SINK ASE {config.ase_id}: cis_id={config.cis_id}, addr={config.addr}')
+        if config.cis_id is None:
+            log(f'Missing cis_id for SINK ASE {config.ase_id}, cannot wait for CIS established')
+            return False
+        stack.bap.wait_cis_established_ev(config.addr_type, config.addr, config.cis_id, 20)
 
     # PTS will change ASE states to streaming when all CISes are established
     for config in stack.bap.ase_configs:
@@ -1924,15 +2031,24 @@ def hdl_wid_364(params: WIDParams):
 
     stack = get_stack()
 
+    # Some test cases expect confirmation after the PTS has sent ISO data to us (Sink)
+    # or after we have sent data (Source). Check both directions.
+    received_any = False
     for config in stack.bap.ase_configs:
-        if config.audio_dir == AudioDir.SOURCE:
-            if config.addr_type == addr_type and config.addr == addr:
-                ev = stack.bap.wait_stream_received_ev(config.addr_type,
-                                                       config.addr,
-                                                       config.ase_id,
-                                                       10)
-                if ev is None:
-                    return False
+        if config.addr_type != addr_type or config.addr != addr:
+            continue
+
+        if config.audio_dir in (AudioDir.SOURCE, AudioDir.SINK):
+            ev = stack.bap.wait_stream_received_ev(config.addr_type,
+                                                   config.addr,
+                                                   config.ase_id,
+                                                   10)
+            if ev is not None:
+                received_any = True
+                break
+
+    if not received_any:
+        return False
 
     return True
 

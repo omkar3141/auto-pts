@@ -737,6 +737,28 @@ def bap_ev_pa_syn_req(bap, data, data_len):
     bap.event_received(defs.BTP_BAP_EV_PA_SYNC_REQ, ev)
 
 
+def bap_ev_cis_established(bap, data, data_len):
+    logging.debug('%s %r', bap_ev_cis_established.__name__, data)
+
+    fmt = '<B6sBB'
+    fmt_len = struct.calcsize(fmt)
+    if len(data) < fmt_len:
+        raise BTPError('Invalid data length')
+
+    addr_type, addr, cis_id, status = struct.unpack_from(fmt, data[:fmt_len])
+
+    addr = binascii.hexlify(addr[::-1]).lower().decode('utf-8')
+
+    ev = (addr_type, addr, cis_id, status)
+
+    if status != 0:
+        logging.warning(f'CIS Established event with error: addr_type {addr_type}, addr {addr}, cis_id {cis_id}, status {status}')
+    else:
+        logging.debug(f'CIS Established event: addr_type {addr_type}, addr {addr}, cis_id {cis_id}, status {status}')
+
+    bap.event_received(defs.BTP_BAP_EV_CIS_ESTABLISHED, ev)
+
+
 BAP_EV = {
     defs.BTP_BAP_EV_DISCOVERY_COMPLETED: bap_ev_discovery_completed_,
     defs.BTP_BAP_EV_CODEC_CAP_FOUND: bap_ev_codec_cap_found_,
@@ -749,4 +771,5 @@ BAP_EV = {
     defs.BTP_BAP_EV_SCAN_DELEGATOR_FOUND: bap_ev_scan_delegator_found_,
     defs.BTP_BAP_EV_BROADCAST_RECEIVE_STATE: bap_ev_broadcast_receive_state_,
     defs.BTP_BAP_EV_PA_SYNC_REQ: bap_ev_pa_syn_req,
+    defs.BTP_BAP_EV_CIS_ESTABLISHED: bap_ev_cis_established,
 }
